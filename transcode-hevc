@@ -1,0 +1,372 @@
+#!/bin/bash
+
+set -euo pipefail
+# set -o xtrace
+
+# Enable vulkan video coding on AMD RADV
+export RADV_PERFTEST=video_decode,video_encode
+# Enable vulkan video coding on Intel ANV
+export ANV_DEBUG=video-decode,video-encode
+
+# Configuration
+VAAPI_DEVICE="${VAAPI_DEVICE:-/dev/dri/renderD128}"
+VULKAN_DEVICE="${VULKAN_DEVICE:-0}"
+
+TARGET_BPKP="${TARGET_BPKP:-85}"  # Default BPKP (bits per kilopixel)
+MAXRATE_RATIO="${MAXRATE_RATIO:-2}" # bitrate to maxrate factor
+BUFSIZE_RATIO="${BUFSIZE_RATIO:-2}" # maxrate to bufsize factor
+RC_MODE="${RC_MODE:-vbr}" # vbr|cbr
+
+INPUT_HW="${1:-auto}"  # auto|vaapi|vulkan
+OUTPUT_HW="${2:-auto}" # auto|vaapi|vulkan
+FILTER_HW="${3:-auto}" # auto|none|software|vaapi|vulkan
+
+get_multiplier() {
+    local width=$1
+    local height=$2
+    local pixels=$((width * height))
+
+    if   [ $pixels -le 500000 ]; then
+        echo 1400
+    elif [ $pixels -le 1000000 ]; then
+        echo 1200
+    elif [ $pixels -le 2500000 ]; then
+        echo 1000
+    elif [ $pixels -le 4500000 ]; then
+        echo 800
+    elif [ $pixels -le 10000000 ]; then
+        echo 700
+    else
+        echo 500
+    fi
+}
+
+calculate_bitrate() {
+    local width=$1
+    local height=$2
+    local fps_frac=$3
+    local baseline_bpkp=$4
+
+    # Parse FPS fraction (e.g., "30/1" or "60000/1001")
+    local fps_num=${fps_frac%/*}
+    local fps_den=${fps_frac#*/}
+    [ "$fps_den" -eq 0 ] && fps_den=1
+
+    local multiplier=$(get_multiplier $width $height)
+    local kilopixels=$((width * height / 1000))
+
+    local adjusted_bpkp=$((baseline_bpkp * multiplier / 1000))
+    
+    # Calculate bitrate preserving FPS precision
+    local bitrate_kbps=$((kilopixels * fps_num * adjusted_bpkp / fps_den / 1000))
+    
+    # Round to nearest 100 kbps
+    bitrate_kbps=$(( (bitrate_kbps + 50) / 100 * 100 ))
+    
+    local max_bitrate=$((bitrate_kbps * $MAXRATE_RATIO))
+    local bufsize=$((max_bitrate * $BUFSIZE_RATIO))
+
+    echo "BITRATE=${bitrate_kbps}k"
+    echo "MAXRATE=${max_bitrate}k"
+    echo "BUFSIZE=${bufsize}k"
+}
+
+probe_input() {
+	local input="$1"
+	local codec_name width height r_frame_rate
+
+	eval $( \
+	  ffprobe \
+	    -loglevel error \
+	    -select_streams v:0 \
+	    -show_entries stream=codec_name,width,height,r_frame_rate \
+	    -of default=noprint_wrappers=1 \
+	    -f mpegts \
+	    "$input" | \
+	  sort -u \
+	)
+	
+	# Validate probe results
+	if [ -z "$width" ] || [ -z "$height" ] || [ -z "$r_frame_rate" ]; then
+	    echo "[ERROR] Failed to probe stream. Using default values." >&2
+	    width=1920
+	    height=1080
+	    r_frame_rate="30/1"
+	fi
+
+	echo "INPUT_CODEC=$codec_name"
+	echo "WIDTH=$width"
+	echo "HEIGHT=$height"
+	echo "FPS_FRAC=$r_frame_rate"
+	echo "WIDTH=$width"
+}
+
+build_filter() {
+	local input_hw="$1"
+	local filter_hw="$2"
+	local output_hw="$3"
+	local filter_in=""
+	local filter_out=""
+	local deinterlace=""
+	
+	case "$filter_hw" in
+		software)
+			deinterlace="bwdif=mode=0:parity=-1:deint=1"
+			if [ -n "$input_hw" ]; then
+				filter_in='hwdownload,format=nv12,'
+			fi
+			if [ -n "$output_hw" ]; then
+				filter_out=',format=nv12,hwupload=extra_hw_frames=8'
+			fi
+			;;
+		vaapi)
+			deinterlace="deinterlace_vaapi=mode=motion_adaptive:rate=frame:auto=1"
+			if [ -z "$input_hw" ]; then
+				filter_in='format=nv12,hwupload,'
+			elif [ "$input_hw" != "$output_hw" ]; then
+				filter_in='hwdownload,format=nv12,hwupload,'
+			fi
+			;;
+		vulkan)
+			deinterlace="bwdif_vulkan=mode=0:parity=-1:deint=1"
+			if [ -z "$input_hw" ]; then
+				filter_in='format=nv12,hwupload,'
+			elif [ "$input_hw" != "$output_hw" ]; then
+				filter_in='hwdownload,format=nv12,hwupload,'
+			fi
+			;;
+		none)
+			if [ -z "$input_hw" ]; then
+				filter_in='format=nv12,hwupload'
+			elif [ "$input_hw" != "$output_hw" ]; then
+				filter_in='hwdownload,format=nv12,hwupload'
+			else
+				filter_in="null"
+			fi
+			;;
+		*)
+			echo "[ERROR] Filter hardware '$filter_hw' not supported" >&2
+			exit 1
+			;;
+	esac
+	
+	echo "${filter_in}${deinterlace}${filter_out}"
+}
+
+show_usage() {
+    cat <<'EOF'
+HEVC Hardware-Accelerated Transcoding Script
+
+USAGE:
+    cat stream.ts | transcode-hevc [INPUT_HW] [OUTPUT_HW] [FILTER_HW] > output.ts
+
+DESCRIPTION:
+    Transcodes MPEG-TS video streams to HEVC using hardware acceleration with
+    automatic bitrate calculation based on resolution, frame rate, and BPKP
+    (bits per kilopixel). Supports VAAPI and Vulkan hardware paths with
+    intelligent deinterlacing.
+
+POSITIONAL ARGUMENTS:
+    INPUT_HW     Hardware decoder to use (default: auto)
+                 Values: auto|vaapi|vulkan
+                 - auto: Automatically selects based on input codec and output HW
+                 - vaapi: Use VA-API for decoding (MPEG2/H.264/HEVC)
+                 - vulkan: Use Vulkan Video for decoding (H.264/HEVC)
+
+    OUTPUT_HW    Hardware encoder to use (default: auto → vulkan)
+                 Values: auto|vaapi|vulkan
+                 - auto: Defaults to vulkan
+                 - vaapi: Use VA-API for encoding (hevc_vaapi)
+                 - vulkan: Use Vulkan Video for encoding (hevc_vulkan)
+
+    FILTER_HW    Deinterlacing hardware (default: auto)
+                 Values: auto|none|software|vaapi|vulkan
+                 - auto: Automatically selects (vulkan if applicable, software otherwise)
+                 - none: No deinterlacing, only format conversion
+                 - software: CPU-based bwdif deinterlacer
+                 - vaapi: VA-API motion-adaptive deinterlacing
+                 - vulkan: Vulkan bwdif deinterlacer
+
+ENVIRONMENT VARIABLES:
+    VAAPI_DEVICE      VA-API device path (default: /dev/dri/renderD128)
+    VULKAN_DEVICE     Vulkan device index (default: 0)
+    TARGET_BPKP       Baseline bits per kilopixel (default: 85)
+                      Controls quality/size tradeoff
+    MAXRATE_RATIO     Bitrate to maxrate multiplier (default: 2)
+    BUFSIZE_RATIO     Maxrate to buffer size multiplier (default: 2)
+    RC_MODE           Rate control mode (default: vbr)
+                      Values: vbr|cbr
+
+BITRATE CALCULATION:
+    The script automatically calculates target bitrate using resolution-adaptive
+    BPKP scaling:
+    
+    Resolution        Multiplier    Effective BPKP (at TARGET_BPKP=85)
+    ≤720x480         1.4×          119 BPKP
+    ≤1280x720        1.2×          102 BPKP
+    ≤1920x1080       1.0×          85 BPKP
+    ≤2560x1440       0.8×          68 BPKP
+    ≤3840x2160       0.7×          59.5 BPKP
+    >4K              0.5×          42.5 BPKP
+
+    Final bitrate = kilopixels × fps × adjusted_BPKP (rounded to 100 kbps)
+
+EXAMPLES:
+    # Default: auto detection, Vulkan encoding, software deinterlacing
+    cat input.ts | transcode-hevc > output.ts
+
+    # Force VAAPI for all operations
+    cat input.ts | transcode-hevc vaapi vaapi vaapi > output.ts
+
+    # Vulkan decode/encode with Vulkan deinterlacing
+    cat input.ts | transcode-hevc vulkan vulkan vulkan > output.ts
+
+    # Custom BPKP for higher quality
+    TARGET_BPKP=120 cat input.ts | transcode-hevc > output.ts
+
+    # CBR mode with custom maxrate ratio
+    RC_MODE=cbr MAXRATE_RATIO=1.5 cat input.ts | transcode-hevc > output.ts
+
+    # Disable deinterlacing
+    cat progressive.ts | transcode-hevc auto auto none > output.ts
+
+SUPPORTED INPUT CODECS:
+    - MPEG2 (vaapi decode, vulkan software decode)
+    - H.264 (vaapi/vulkan hardware decode)
+    - HEVC (vaapi/vulkan hardware decode)
+
+OUTPUT FORMAT:
+    - Codec: HEVC Main Profile, High Tier, Level 5.0
+    - Container: MPEG-TS with low-latency flags
+    - Audio/Subtitles: Pass-through (copy)
+    - Metadata: Preserved from source
+
+NOTES:
+    - Input MUST be MPEG-TS format via stdin (pipe:0)
+    - Output is written to stdout (pipe:1)
+    - Vulkan support requires RADV_PERFTEST or ANV_DEBUG environment variables
+      (automatically set by script)
+    - Script uses strict error handling (set -euo pipefail)
+    - All diagnostic output goes to stderr
+
+EOF
+}
+
+if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+    show_usage
+    exit 0
+fi
+
+echo "[INFO] Probing stream parameters..." >&2
+eval $(probe_input "pipe:0")
+
+# Calculate bitrate using BPP formula
+eval $(calculate_bitrate "$WIDTH" "$HEIGHT" "$FPS_FRAC" "$TARGET_BPKP")
+
+echo "[INFO] Detected: ${INPUT_CODEC} ${WIDTH}x${HEIGHT} @ ${FPS_FRAC}" >&2
+echo "[INFO] BPKP Factor: ${TARGET_BPKP}" >&2
+echo "[INFO] Target Bitrate: ${BITRATE}, Max Rate: ${MAXRATE}, Buffer: ${BUFSIZE}" >&2
+
+if [ "$OUTPUT_HW" = "auto" ]; then
+	OUTPUT_HW="vulkan"
+fi
+
+if [ "$FILTER_HW" = "auto" ]; then
+	FILTER_HW="" # Let OUTPUT_HW decide
+fi
+
+case "$INPUT_HW" in
+	vaapi|vulkan)
+		;;
+	auto)
+		INPUT_HW="" # Let OUTPUT_HW decide
+		;;
+	*)
+		echo "[ERROR] Input hardware '$INPUT_HW' not supported" >&2
+		exit 1
+		;;
+esac
+
+case "$OUTPUT_HW" in
+	vaapi)
+		OUTPUT_CODEC="hevc_vaapi"
+		RC_MODE="${RC_MODE^^}" # vaapi rc_mode constants are uppercase
+		case "$INPUT_CODEC" in
+			mpeg2video|h264|hevc)
+				INPUT_HW="${INPUT_HW:-vaapi}"
+				;;
+		esac
+		;;
+	vulkan)
+		OUTPUT_CODEC="hevc_vulkan"
+		RC_MODE="${RC_MODE,,}" # vulkan rc_mode constants are lowercase
+		case "$INPUT_CODEC" in
+			h264|hevc)
+				INPUT_HW="${INPUT_HW:-vulkan}"
+				FILTER_HW="${FILTER_HW:-vulkan}"
+				;;
+			mpeg2video)
+				FILTER_HW="${FILTER_HW:-vulkan}"
+				;;
+		esac
+		;;
+	*)
+		echo "[ERROR] Output hardware '$OUTPUT_HW' not supported" >&2
+		exit 1
+		;;
+esac
+
+# Default to software interpolation
+FILTER_HW="${FILTER_HW:-software}"
+
+FILTER=$(build_filter "$INPUT_HW" "$FILTER_HW" "$OUTPUT_HW")
+
+echo "[INFO] From ${INPUT_CODEC} (${INPUT_HW:-software}) to ${OUTPUT_CODEC} (${OUTPUT_HW}) using filter ${FILTER_HW}" >&2
+
+# Ensure well-formed command if no INPUT_HW by defaulting
+# to OUTPUT_HW. FFmpeg will default to software decoding
+# when input hwaccel is not supported.
+INPUT_HW="${INPUT_HW:-${OUTPUT_HW}}"
+
+# Encode with calculated parameters
+ffmpeg \
+  -hide_banner \
+  -loglevel error \
+  -nostdin \
+  -init_hw_device "vaapi=vaapi:${VAAPI_DEVICE}" \
+  -init_hw_device "vulkan=vulkan:${VULKAN_DEVICE}" \
+  -hwaccel_device "$INPUT_HW" \
+  -hwaccel "$INPUT_HW" \
+  -hwaccel_output_format "$INPUT_HW" \
+  -f mpegts \
+  -c:v "$INPUT_CODEC" \
+  -i pipe:0 \
+  -filter_hw_device "$OUTPUT_HW" \
+  -vf "$FILTER" \
+  -map 0:v:0 \
+  -c:v "$OUTPUT_CODEC" \
+  -rc_mode "$RC_MODE" \
+  -b:v "$BITRATE" \
+  -maxrate "$MAXRATE" \
+  -bufsize "$BUFSIZE" \
+  -compression_level 29 \
+  -profile:v main \
+  -tier high \
+  -level 5.0 \
+  -aud 1 \
+  -sei 1 \
+  -force_key_frames source \
+  -async_depth 4 \
+  -bf 0 \
+  -map 0:a \
+  -c:a copy \
+  -map 0:s? \
+  -c:s copy \
+  -map_metadata 0 \
+  -f mpegts \
+  -fflags nobuffer \
+  -flags low_delay \
+  pipe:1
+
+echo "[INFO] Encoding complete" >&2
+

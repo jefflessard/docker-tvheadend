@@ -5,11 +5,8 @@
 FROM ghcr.io/linuxserver/picons-builder as piconsstage
 
 
-FROM ghcr.io/linuxserver/baseimage-alpine:3.20 as buildstage
+FROM ghcr.io/linuxserver/baseimage-alpine:edge as buildstage
 ############## build stage ##############
-
-# package versions
-ARG ARGTABLE_VER="2.13"
 
 # environment settings
 ARG TZ="Etc/UTC"
@@ -23,12 +20,13 @@ COPY --from=piconsstage /picons.tar.bz2 /picons.tar.bz2
 RUN \
   echo "**** install build packages ****" && \
   apk add --no-cache \
+    argtable2-dev \
     autoconf \
     automake \
     bsd-compat-headers \
     build-base \
     cmake \
-    ffmpeg4-dev \
+    ffmpeg-dev \
     file \
     findutils \
     gettext-dev \
@@ -57,11 +55,6 @@ RUN \
     zlib-dev
 
 RUN \
-  echo "**** remove musl iconv.h and replace with gnu-iconv.h ****" && \
-  rm -rf /usr/include/iconv.h && \
-  cp /usr/include/gnu-libiconv/iconv.h /usr/include/iconv.h
-
-RUN \
   echo "**** compile tvheadend ****" && \
   if [ -z ${TVHEADEND_COMMIT+x} ]; then \
     TVHEADEND_COMMIT=$(curl -sX GET https://api.github.com/repos/tvheadend/tvheadend/commits/master \
@@ -69,7 +62,7 @@ RUN \
   fi && \
   mkdir -p \
     /tmp/tvheadend && \
-  git clone https://github.com/tvheadend/tvheadend.git /tmp/tvheadend && \
+  git clone https://github.com/jefflessard/tvheadend.git /tmp/tvheadend && \
   cd /tmp/tvheadend && \
   git checkout ${TVHEADEND_COMMIT} && \
   ./configure \
@@ -106,39 +99,18 @@ RUN \
     --prefix=/usr \
     --python=python3 \
     --sysconfdir=/config && \
-  make -j 2 && \
+  make -j$(nproc) && \
   make DESTDIR=/tmp/tvheadend-build install
 
 RUN \
-  echo "**** compile argtable2 ****" && \
-  ARGTABLE_VER1="${ARGTABLE_VER//./-}" && \
-  mkdir -p \
-    /tmp/argtable && \
-  curl -s -o \
-  /tmp/argtable-src.tar.gz -L \
-    "https://sourceforge.net/projects/argtable/files/argtable/argtable-${ARGTABLE_VER}/argtable${ARGTABLE_VER1}.tar.gz" && \
-  tar xf \
-  /tmp/argtable-src.tar.gz -C \
-    /tmp/argtable --strip-components=1 && \
-  cp /tmp/patches/config.* /tmp/argtable && \
-  cd /tmp/argtable && \
-  ./configure \
-    --prefix=/usr && \
-  make -j 2 && \
-  make check && \
-  make DESTDIR=/tmp/argtable-build install && \
-  echo "**** copy to /usr for comskip dependency ****" && \
-  cp -pr /tmp/argtable-build/usr/* /usr/
-
-RUN \
   echo "***** compile comskip ****" && \
-  git clone https://github.com/erikkaashoek/Comskip /tmp/comskip && \
+  git clone https://github.com/kainlan/Comskip /tmp/comskip && \
   cd /tmp/comskip && \
   ./autogen.sh && \
   ./configure \
     --bindir=/usr/bin \
     --sysconfdir=/config/comskip && \
-  make -j 2 && \
+  make -j$(nproc) && \
   make DESTDIR=/tmp/comskip-build install
 
 RUN \
@@ -148,8 +120,38 @@ RUN \
     /picons.tar.bz2 -C \
     /picons
 
+
+############## ffmpeg build stage ##############
+FROM ghcr.io/linuxserver/baseimage-alpine:edge as ffmpegbuild
+
+# Install Alpine build tools
+RUN apk add --no-cache alpine-sdk sudo git
+
+# Create builder user with proper home directory
+RUN adduser -D builder && \
+    addgroup builder abuild && \
+    echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+# Switch to builder user
+USER builder
+WORKDIR /home/builder
+ENV HOME /home/builder
+
+COPY ffmpeg.APKBUILD.patch /tmp/patches/
+
+RUN \
+  abuild-keygen -a -i -n && \
+  git clone --depth=1 https://gitlab.alpinelinux.org/alpine/aports.git && \
+  cd /home/builder/aports/community/ffmpeg && \
+  cp /tmp/patches/ffmpeg.APKBUILD.patch /home/builder/aports && \
+  git apply /home/builder/aports/ffmpeg.APKBUILD.patch && \
+  abuild deps && \
+  abuild -r
+
+# Packages will be in ~/packages/community/<arch>/
+
 ############## runtime stage ##############
-FROM ghcr.io/linuxserver/baseimage-alpine:3.20
+FROM ghcr.io/linuxserver/baseimage-alpine:edge
 
 # set version label
 ARG BUILD_DATE
@@ -159,20 +161,24 @@ LABEL maintainer="saarg"
 
 # environment settings
 ENV HOME="/config"
+ENV RADV_PERFTEST="video_decode,video_encode"
+ENV ANV_DEBUG="video-decode,video-encode"
+
+COPY --from=ffmpegbuild /home/builder/packages/community /tmp/packages/ffmpeg
 
 RUN \
   echo "**** install runtime packages ****" && \
-  apk add --no-cache \
+  apk add --no-cache --repository /tmp/packages/ffmpeg --allow-untrusted \
+    argtable2 \
     bsd-compat-headers \
     ffmpeg \
-    ffmpeg4-libavcodec \
-    ffmpeg4-libavdevice \
-    ffmpeg4-libavfilter \
-    ffmpeg4-libavformat \
-    ffmpeg4-libavutil \
-    ffmpeg4-libpostproc \
-    ffmpeg4-libswresample \
-    ffmpeg4-libswscale \
+    ffmpeg-libavcodec \
+    ffmpeg-libavdevice \
+    ffmpeg-libavfilter \
+    ffmpeg-libavformat \
+    ffmpeg-libavutil \
+    ffmpeg-libswresample \
+    ffmpeg-libswscale \
     gnu-libiconv \
     libdvbcsa \
     libhdhomerun-libs \
@@ -184,6 +190,8 @@ RUN \
     libxslt \
     linux-headers \
     mesa-va-gallium \
+    mesa-vulkan-ati \
+    mesa-vulkan-intel \
     opus \
     pcre2 \
     perl \
@@ -192,18 +200,23 @@ RUN \
     perl-json-xs \
     py3-requests \
     python3 \
+    shaderc \
     uriparser \
+    vulkan-tools \
     x264 \
     x265 \
     xmltv \
     zlib && \
   printf "Linuxserver.io version: ${VERSION}\nBuild-date: ${BUILD_DATE}" > /build_version
 
+RUN \
+  rm -rf /tmp/packages
+
 # copy local files and buildstage artifacts
-COPY --from=buildstage /tmp/argtable-build/usr/ /usr/
 COPY --from=buildstage /tmp/comskip-build/usr/ /usr/
 COPY --from=buildstage /tmp/tvheadend-build/usr/ /usr/
 COPY --from=buildstage /picons /picons
+COPY transcode-hevc /usr/bin/
 COPY root/ /
 
 # ports and volumes

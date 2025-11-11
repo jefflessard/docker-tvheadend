@@ -1,0 +1,20 @@
+diff --git a/community/ffmpeg/APKBUILD b/community/ffmpeg/APKBUILD
+index 00d1ad84235..bf4b4875df3 100644
+--- a/community/ffmpeg/APKBUILD
++++ b/community/ffmpeg/APKBUILD
+@@ -46,6 +46,7 @@ makedepends="
+ 	perl-dev
+ 	pulseaudio-dev
+ 	rav1e-dev
++	shaderc-dev
+ 	sdl2-dev
+ 	soxr-dev
+ 	v4l-utils-dev
+@@ -260,6 +261,7 @@ build() {
+ 		--enable-libpulse \
+ 		--enable-librav1e \
+ 		--enable-librist \
++		--enable-libshaderc \
+ 		--enable-libsoxr \
+ 		--enable-libsrt \
+ 		--enable-libssh \
