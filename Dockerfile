@@ -120,36 +120,6 @@ RUN \
     /picons.tar.bz2 -C \
     /picons
 
-
-############## ffmpeg build stage ##############
-FROM ghcr.io/linuxserver/baseimage-alpine:edge as ffmpegbuild
-
-# Install Alpine build tools
-RUN apk add --no-cache alpine-sdk sudo git
-
-# Create builder user with proper home directory
-RUN adduser -D builder && \
-    addgroup builder abuild && \
-    echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-
-# Switch to builder user
-USER builder
-WORKDIR /home/builder
-ENV HOME /home/builder
-
-COPY ffmpeg.APKBUILD.patch /tmp/patches/
-
-RUN \
-  abuild-keygen -a -i -n && \
-  git clone --depth=1 https://gitlab.alpinelinux.org/alpine/aports.git && \
-  cd /home/builder/aports/community/ffmpeg && \
-  cp /tmp/patches/ffmpeg.APKBUILD.patch /home/builder/aports && \
-  git apply /home/builder/aports/ffmpeg.APKBUILD.patch && \
-  abuild deps && \
-  abuild -r
-
-# Packages will be in ~/packages/community/<arch>/
-
 ############## runtime stage ##############
 FROM ghcr.io/linuxserver/baseimage-alpine:edge
 
@@ -164,11 +134,9 @@ ENV HOME="/config"
 ENV RADV_PERFTEST="video_decode,video_encode"
 ENV ANV_DEBUG="video-decode,video-encode"
 
-COPY --from=ffmpegbuild /home/builder/packages/community /tmp/packages/ffmpeg
-
 RUN \
   echo "**** install runtime packages ****" && \
-  apk add --no-cache --repository /tmp/packages/ffmpeg --allow-untrusted \
+  apk add --no-cache \
     argtable2 \
     bsd-compat-headers \
     ffmpeg \
